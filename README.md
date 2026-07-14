@@ -1,15 +1,44 @@
 # PDF Word Editor
 
-A tool for editing the actual words in a PDF. Click any word in your browser
-and retype it, or do document-wide find-and-replace — the result is a real,
-searchable, selectable PDF, not an image overlay.
+A tool for editing the actual words in a PDF. Click any word and retype it, or
+do document-wide find-and-replace, keeping the original size, colour, and font
+style (serif/mono, bold, italic).
 
-Under the hood it uses [PyMuPDF](https://pymupdf.readthedocs.io/) to remove the
-original glyphs (via redaction) and re-insert your new text at the same
-position, matching the original size, colour, and font style (serif/mono,
-bold, italic).
+It comes in two forms:
+
+| | [Website](docs/) (browser-only) | [Local app / CLI](#python-app-interactive) (Python) |
+|---|---|---|
+| Runs | 100% in your browser, no server | Local Flask server / command line |
+| Your file | never leaves your device | stays on your machine |
+| Hosting | any static host (e.g. GitHub Pages) | run `python app.py` |
+| Editing | overlays new text over the old glyphs | **true redaction** — removes old glyphs from the text layer |
+| Best when | you want zero-install, shareable, private | you need a clean, searchable text layer |
 
 ![what it does](https://img.shields.io/badge/edit-real%20PDF%20text-2f6fed)
+
+## Website (no install, runs in the browser)
+
+The [`docs/`](docs/) folder is a fully self-contained static site — open
+`docs/index.html` and everything (rendering, editing, saving) happens in your
+browser. The `pdf.js` and `pdf-lib` libraries are vendored locally, so the page
+makes **no external network requests** and your PDF is never uploaded anywhere.
+
+Try it locally:
+
+```bash
+# any static file server works; for example:
+python -m http.server -d docs 8000    # then open http://localhost:8000
+```
+
+**Host it on GitHub Pages:** in the repository settings, set Pages to serve from
+the `/docs` folder of your default branch. The editor is then live at
+`https://<user>.github.io/<repo>/`.
+
+> **Note:** the browser version *covers* the original text and draws the new
+> text on top, so the visual result is correct but the original words remain in
+> the PDF's hidden text layer (still copy/searchable underneath). When you need
+> the old text genuinely removed, use the Python app below, which does true
+> redaction.
 
 ## Features
 
@@ -17,20 +46,19 @@ bold, italic).
 - **Find & replace** — replace every occurrence of a phrase across the whole document.
 - **Style preservation** — keeps font size, colour, bold/italic, and serif vs. sans.
 - **Background matching** — sampled fill so edits blend into coloured/shaded pages.
-- **True text output** — the edited PDF stays selectable and searchable.
-- **Web UI + CLI** — a browser app for interactive edits, a CLI for scripted/batch jobs.
+- **Real PDF output** — the result is a normal PDF, not a flattened image.
+- **Three ways to use it** — a zero-install website, a local web app, and a CLI.
 
-## Install
+## Python app (interactive)
+
+The Python app does **true redaction** — it removes the original glyphs from the
+content stream and re-inserts your new text, so the output has a clean,
+searchable text layer.
 
 Requires Python 3.9+.
 
 ```bash
 pip install -r requirements.txt
-```
-
-## Web app (interactive)
-
-```bash
 python app.py
 ```
 
@@ -106,10 +134,15 @@ things are inherent to editing text in place:
 ## Project layout
 
 ```
-app.py           Flask web server (REST API + serves the UI)
-pdf_editor.py    Core editing engine (PyMuPDF)
-cli.py           Command-line interface
-templates/       index.html (single-page UI)
-static/          app.js, style.css
+docs/                 Browser-only website (static, hostable on GitHub Pages)
+  index.html            single-page UI
+  app.js                client-side editor (pdf.js + pdf-lib)
+  style.css
+  vendor/               vendored pdf.js and pdf-lib (no CDN needed)
+
+app.py                Flask web server for the Python app (REST API + UI)
+pdf_editor.py         Core editing engine (PyMuPDF, true redaction)
+cli.py                Command-line interface
+templates/, static/   UI for the Flask app
 requirements.txt
 ```
