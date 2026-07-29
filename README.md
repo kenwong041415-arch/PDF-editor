@@ -18,21 +18,34 @@ It comes in two forms:
 
 ## Website (no install, runs in the browser)
 
-The [`docs/`](docs/) folder is a fully self-contained static site — open
-`docs/index.html` and everything (rendering, editing, saving) happens in your
-browser. The `pdf.js` and `pdf-lib` libraries are vendored locally, so the page
-makes **no external network requests** and your PDF is never uploaded anywhere.
+The [`docs/`](docs/) folder is a fully self-contained static site — everything
+(rendering, editing, saving) happens in your browser. The `pdf.js` and `pdf-lib`
+libraries are vendored locally, so the page makes **no external network
+requests** and your PDF is never uploaded anywhere.
 
-Try it locally:
+### Quickest demo: the single file
+
+[`docs/standalone.html`](docs/standalone.html) bundles the whole editor —
+markup, styles, and both libraries — into one file. **Download it and
+double-click to open it in any browser.** No server, no install, works offline.
+
+Rebuild it after changing anything under `docs/` with:
 
 ```bash
-# any static file server works; for example:
+python build_standalone.py     # regenerates docs/standalone.html
+```
+
+### Serve the folder locally
+
+```bash
 python -m http.server -d docs 8000    # then open http://localhost:8000
 ```
 
-**Host it on GitHub Pages:** in the repository settings, set Pages to serve from
-the `/docs` folder of your default branch. The editor is then live at
-`https://<user>.github.io/<repo>/`.
+### Host it on GitHub Pages (shareable URL)
+
+In the repository's **Settings → Pages**, choose **Deploy from a branch**, pick
+the branch that contains `docs/`, set the folder to **`/docs`**, and Save. After
+a minute the editor is live at `https://<user>.github.io/<repo>/`.
 
 > **Note:** the browser version *covers* the original text and draws the new
 > text on top, so the visual result is correct but the original words remain in
@@ -138,7 +151,9 @@ docs/                 Browser-only website (static, hostable on GitHub Pages)
   index.html            single-page UI
   app.js                client-side editor (pdf.js + pdf-lib)
   style.css
+  standalone.html       everything inlined into one openable file
   vendor/               vendored pdf.js and pdf-lib (no CDN needed)
+build_standalone.py   regenerates docs/standalone.html from the docs/ sources
 
 app.py                Flask web server for the Python app (REST API + UI)
 pdf_editor.py         Core editing engine (PyMuPDF, true redaction)
