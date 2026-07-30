@@ -12,6 +12,7 @@ It comes in two forms:
 | Your file | never leaves your device | stays on your machine |
 | Hosting | any static host (e.g. GitHub Pages) | run `python app.py` |
 | Editing | overlays new text over the old glyphs | **true redaction** — removes old glyphs from the text layer |
+| Font used for edits | the document's own embedded font, reused exactly (falls back to a standard font only if that font can't be reused) | same |
 | Best when | you want zero-install, shareable, private | you need a clean, searchable text layer |
 
 ![what it does](https://img.shields.io/badge/edit-real%20PDF%20text-2f6fed)
@@ -19,9 +20,17 @@ It comes in two forms:
 ## Website (no install, runs in the browser)
 
 The [`docs/`](docs/) folder is a fully self-contained static site — everything
-(rendering, editing, saving) happens in your browser. The `pdf.js` and `pdf-lib`
-libraries are vendored locally, so the page makes **no external network
-requests** and your PDF is never uploaded anywhere.
+(rendering, editing, saving) happens in your browser. The `pdf.js`, `pdf-lib`,
+and `fontkit` libraries are vendored locally, so the page makes **no external
+network requests** and your PDF is never uploaded anywhere.
+
+Edited text is drawn using the PDF's own embedded font whenever possible —
+pdf.js reveals the real font behind each piece of text (even when the PDF's
+internal font name gives no hint of it, e.g. a generic name like
+"CIDFont+F1"), and that exact font is pulled out of the source file and
+reused via `fontkit`, not approximated. A standard font is only used as a
+fallback, when the original font isn't embedded or is missing a character the
+replacement text needs.
 
 ### Quickest demo: the single file
 
@@ -152,7 +161,7 @@ docs/                 Browser-only website (static, hostable on GitHub Pages)
   app.js                client-side editor (pdf.js + pdf-lib)
   style.css
   standalone.html       everything inlined into one openable file
-  vendor/               vendored pdf.js and pdf-lib (no CDN needed)
+  vendor/               vendored pdf.js, pdf-lib, and fontkit (no CDN needed)
 build_standalone.py   regenerates docs/standalone.html from the docs/ sources
 
 app.py                Flask web server for the Python app (REST API + UI)

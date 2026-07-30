@@ -8,12 +8,25 @@
  *   - The user clicks a text item and retypes it; edits are recorded.
  *   - On download, pdf-lib opens the ORIGINAL bytes, covers each edited item's
  *     rectangle with its sampled background colour, and draws the new text at
- *     the same baseline using a standard font matched to the original style.
+ *     the same baseline. The font used for that text is picked in this order:
+ *       1. The document's own embedded font for that item, reused directly --
+ *          pdf.js exposes the real PDF font name (e.g. "CIDFont+F1") via
+ *          each item's loaded font object even when a PDF's font *resource*
+ *          name gives no hint of it; pdf-lib's low-level object graph is then
+ *          used to pull the actual font program bytes out of the source PDF,
+ *          and fontkit embeds them for pdf-lib to draw with -- an exact
+ *          match, not an approximation.
+ *       2. If that font can't be reused (not embedded, corrupt, or missing a
+ *          glyph the replacement text needs), fall back to a standard font
+ *          matched to the original style (serif/mono, bold, italic).
  *
  * Nothing is uploaded anywhere -- all processing happens in this browser tab.
  */
 
-const { PDFDocument, StandardFonts, rgb } = PDFLib;
+const {
+  PDFDocument, StandardFonts, rgb,
+  PDFName, PDFDict, PDFArray, PDFRawStream, decodePDFRawStream,
+} = PDFLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
 
 // --- State -------------------------------------------------------------
@@ -28,6 +41,7 @@ const state = {
   // current render context:
   viewport: null,
   items: [],           // text items on the current page
+  pdfPage: null,       // current pdf.js Page object (for font lookups)
 };
 
 // --- Element refs ------------------------------------------------------
@@ -107,6 +121,7 @@ function resetToUpload() {
 async function renderPage(pageNo) {
   state.page = pageNo;
   const page = await state.pdfDoc.getPage(pageNo + 1);
+  state.pdfPage = page;
   const viewport = page.getViewport({ scale: state.zoom });
   state.viewport = viewport;
 
@@ -147,7 +162,7 @@ function buildOverlay() {
     div.style.top = box.top + "px";
     div.style.width = Math.max(box.width, 6) + "px";
     div.style.height = box.height + "px";
-    div.title = "Click to edit";
+    div.title = rec.item.str;
 
     const edit = state.edits.get(key);
     if (edit) {
@@ -256,6 +271,20 @@ function fontInfo(rec) {
   return { key, css, bold, italic };
 }
 
+// Real PDF font name (e.g. "CIDFont+F1") behind a pdf.js text item, straight
+// from the loaded font object pdf.js parsed -- independent of the item's own
+// internal alias and of whatever the PDF's font *resource* name happens to
+// look like. Used at download time to pull the exact font out of the source
+// PDF instead of approximating it. Returns null if unavailable.
+function getRealFontName(pdfPage, item) {
+  try {
+    const fontObj = pdfPage && pdfPage.commonObjs.get(item.fontName);
+    return (fontObj && fontObj.name) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // --- Editing -----------------------------------------------------------
 function openEditor(rec, box) {
   const existing = overlay.querySelector(".span-editor");
@@ -323,6 +352,7 @@ function recordEdit(rec, box, newText) {
     color,
     fontKey: fi.key,
     fontFamily: fi.css,
+    realFontName: getRealFontName(state.pdfPage, rec.item),
   });
 }
 
@@ -370,6 +400,7 @@ async function replaceAll() {
         state.edits.set(`${p}:${rec.index}`, {
           page: p, x: t[4], yBaseline: t[5], fontSize, width: rec.item.width,
           newText, origText: rec.item.str, bg, color, fontKey: fi.key, fontFamily: fi.css,
+          realFontName: getRealFontName(page, rec.item),
         });
         count++;
       }
@@ -391,6 +422,82 @@ function offPixelBox(item, vp) {
   return { left: tx[4], top: tx[5] - fontH, width: item.width * vp.scale, height: fontH };
 }
 
+// Pull an embedded font's raw program bytes out of the SOURCE pdf-lib
+// document by matching a font resource's BaseFont name against the real PDF
+// font name pdf.js reported for the edited item (see getRealFontName).
+// Walks the low-level object graph directly since pdf-lib has no high-level
+// "find this font" helper. Returns null (caller falls back) on any
+// structural surprise -- a hand-written PDF's object graph can always defy
+// this simple font dictionary shape (e.g. a Type3 font, or a font that lost
+// its descriptor).
+function findEmbeddedFontBytes(outDoc, pageIndex, realFontName) {
+  try {
+    const page = outDoc.getPages()[pageIndex];
+    const resources = page.node.Resources();
+    const fontDict = resources.lookup(PDFName.of("Font"), PDFDict);
+    if (!fontDict) return null;
+    const wanted = PDFName.of(realFontName).toString();
+
+    for (const [, ref] of fontDict.entries()) {
+      const fontObj = outDoc.context.lookup(ref, PDFDict);
+      const baseFont = fontObj.get(PDFName.of("BaseFont"));
+      if (!baseFont || baseFont.toString() !== wanted) continue;
+
+      let descriptorEntry = fontObj.get(PDFName.of("FontDescriptor"));
+      if (!descriptorEntry) {
+        // Composite (Type0/CID) fonts carry their descriptor one level down.
+        const descendants = fontObj.get(PDFName.of("DescendantFonts"));
+        if (!descendants) continue;
+        const descArr = outDoc.context.lookup(descendants, PDFArray);
+        const descFontObj = outDoc.context.lookup(descArr.get(0), PDFDict);
+        descriptorEntry = descFontObj.get(PDFName.of("FontDescriptor"));
+      }
+      if (!descriptorEntry) continue;
+
+      const descDict = outDoc.context.lookup(descriptorEntry, PDFDict);
+      for (const key of ["FontFile2", "FontFile3", "FontFile"]) {
+        const ffEntry = descDict.get(PDFName.of(key));
+        if (!ffEntry) continue;
+        const stream = outDoc.context.lookup(ffEntry, PDFRawStream);
+        return decodePDFRawStream(stream).decode();
+      }
+      return null; // matched the font but it isn't embedded
+    }
+  } catch (e) {
+    // Fall through to null -- caller falls back to a standard font.
+  }
+  return null;
+}
+
+// Choose (and cache) the font to draw replacement text with. Prefers the
+// document's own embedded font when it covers every character being drawn;
+// otherwise falls back to the closest-matching standard font.
+async function pickFont(outDoc, fontCache, pageIndex, realFontName, fallbackKey, neededText) {
+  if (realFontName) {
+    const cacheKey = `${pageIndex}:${realFontName}`;
+    if (!(cacheKey in fontCache.reuse)) {
+      let entry = null;
+      const bytes = findEmbeddedFontBytes(outDoc, pageIndex, realFontName);
+      if (bytes) {
+        try {
+          entry = { fk: fontkit.create(bytes), embedded: await outDoc.embedFont(bytes, { subset: false }) };
+        } catch (e) {
+          entry = null; // not embeddable / corrupt font program
+        }
+      }
+      fontCache.reuse[cacheKey] = entry;
+    }
+    const entry = fontCache.reuse[cacheKey];
+    if (entry && Array.from(neededText).every((ch) => entry.fk.hasGlyphForCodePoint(ch.codePointAt(0)))) {
+      return entry.embedded;
+    }
+  }
+  if (!fontCache.fallback[fallbackKey]) {
+    fontCache.fallback[fallbackKey] = await outDoc.embedFont(StandardFonts[fallbackKey]);
+  }
+  return fontCache.fallback[fallbackKey];
+}
+
 // --- Build & download the edited PDF -----------------------------------
 async function download() {
   if (state.edits.size === 0) {
@@ -399,39 +506,44 @@ async function download() {
   spinner(true, "Building edited PDF…");
   try {
     const outDoc = await PDFDocument.load(state.masterBytes);
+    outDoc.registerFontkit(fontkit);
     const pages = outDoc.getPages();
-    const fontCache = {};
-    const getFont = async (name) => {
-      if (!fontCache[name]) fontCache[name] = await outDoc.embedFont(StandardFonts[name]);
-      return fontCache[name];
-    };
+    const fontCache = { reuse: {}, fallback: {} };
+    let skipped = 0;
 
     for (const edit of state.edits.values()) {
       const page = pages[edit.page];
-      const font = await getFont(edit.fontKey);
-
-      // 1. Cover the original glyphs with the sampled background colour.
-      const pad = edit.fontSize * 0.12;
-      page.drawRectangle({
-        x: edit.x - pad,
-        y: edit.yBaseline - edit.fontSize * 0.26,
-        width: (edit.width || edit.fontSize) + pad * 2,
-        height: edit.fontSize * 1.2,
-        color: rgb(edit.bg[0], edit.bg[1], edit.bg[2]),
-      });
-
-      // 2. Draw the replacement text, shrinking to fit the original width.
-      if (edit.newText) {
-        let size = edit.fontSize;
-        const w = font.widthOfTextAtSize(edit.newText, size);
-        if (edit.width > 0 && w > edit.width) size = Math.max(4, size * (edit.width / w));
-        page.drawText(edit.newText, {
-          x: edit.x,
-          y: edit.yBaseline,
-          size,
-          font,
-          color: rgb(edit.color[0], edit.color[1], edit.color[2]),
+      try {
+        // 1. Cover the original glyphs with the sampled background colour.
+        const pad = edit.fontSize * 0.12;
+        page.drawRectangle({
+          x: edit.x - pad,
+          y: edit.yBaseline - edit.fontSize * 0.26,
+          width: (edit.width || edit.fontSize) + pad * 2,
+          height: edit.fontSize * 1.2,
+          color: rgb(edit.bg[0], edit.bg[1], edit.bg[2]),
         });
+
+        // 2. Draw the replacement text, shrinking to fit the original width.
+        if (edit.newText) {
+          const font = await pickFont(outDoc, fontCache, edit.page, edit.realFontName, edit.fontKey, edit.newText);
+          let size = edit.fontSize;
+          const w = font.widthOfTextAtSize(edit.newText, size);
+          if (edit.width > 0 && w > edit.width) size = Math.max(4, size * (edit.width / w));
+          page.drawText(edit.newText, {
+            x: edit.x,
+            y: edit.yBaseline,
+            size,
+            font,
+            color: rgb(edit.color[0], edit.color[1], edit.color[2]),
+          });
+        }
+      } catch (editErr) {
+        // A single edit failing (typically a character neither the original
+        // font nor the standard-font fallback can encode, e.g. CJK) must not
+        // discard every other edit -- skip just this one and keep going.
+        console.error("Skipping one edit:", editErr);
+        skipped++;
       }
     }
 
@@ -445,7 +557,12 @@ async function download() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast("Downloaded edited PDF");
+    toast(
+      skipped > 0
+        ? `Downloaded — ${skipped} edit${skipped > 1 ? "s" : ""} skipped (unsupported characters)`
+        : "Downloaded edited PDF",
+      skipped > 0 ? 5000 : 2200
+    );
   } catch (err) {
     console.error(err);
     toast("Could not build PDF: " + err.message);

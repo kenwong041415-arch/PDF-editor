@@ -2,9 +2,9 @@
 """Bundle the docs/ site into a single self-contained HTML file.
 
 Produces ``docs/standalone.html`` -- one file that inlines the CSS, the app
-code, and the pdf.js / pdf-lib libraries, and runs the pdf.js worker from an
-in-page Blob URL. It has no external dependencies and works straight from
-``file://`` (just double-click it) as well as any static host.
+code, and the pdf.js / pdf-lib / fontkit libraries, and runs the pdf.js
+worker from an in-page Blob URL. It has no external dependencies and works
+straight from ``file://`` (just double-click it) as well as any static host.
 
 Usage:
     python build_standalone.py
@@ -23,6 +23,7 @@ def main() -> None:
     app = (DOCS / "app.js").read_text()
     pdfjs = (DOCS / "vendor" / "pdf.min.js").read_text()
     pdflib = (DOCS / "vendor" / "pdf-lib.min.js").read_text()
+    fontkit = (DOCS / "vendor" / "fontkit.umd.min.js").read_text()
     worker = (DOCS / "vendor" / "pdf.worker.min.js").read_text()
     index = (DOCS / "index.html").read_text()
 
@@ -56,6 +57,7 @@ def main() -> None:
 
 <script>{pdfjs}</script>
 <script>{pdflib}</script>
+<script>{fontkit}</script>
 <script id="pdfjs-worker" type="text/plain">{worker}</script>
 <script>
 {app}
