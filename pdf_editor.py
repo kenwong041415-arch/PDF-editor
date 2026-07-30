@@ -6,9 +6,18 @@ reported by PyMuPDF). To change a word we:
   1. Cover the original span's rectangle with a redaction annotation filled
      with the detected background colour, then apply it (this truly removes
      the old glyphs from the content stream, not just hides them).
-  2. Re-insert the new text at the original baseline using a base-14 font
-     chosen to match the original style (serif/mono, bold, italic) at the
-     same size and colour.
+  2. Re-insert the new text at the original baseline, at the same size and
+     colour, using a font chosen in this order:
+       a. The document's own embedded font for that span, reused directly
+          -- an exact match, not an approximation. Many PDFs (especially
+          ones produced by "print to PDF" pipelines) give embedded fonts
+          generic resource names like "CIDFont+F1" that reveal nothing
+          about the real typeface, so this is discovered by extracting the
+          actual font program and checking it contains every character the
+          replacement text needs.
+       b. If that font can't be reused (not embedded, corrupt, or missing a
+          needed glyph), fall back to a base-14 font chosen to match the
+          original style (serif/mono, bold, italic).
 
 This keeps the rest of the page byte-for-byte intact and produces a real,
 searchable, selectable PDF -- not an image overlay.
@@ -101,6 +110,12 @@ class PDFDocument:
     def __init__(self, data: bytes, name: str = "document.pdf"):
         self.name = name
         self.doc = fitz.open(stream=data, filetype="pdf")
+        # Cache of (page_no, pdf_font_resource_name) -> (font_bytes, fitz.Font)
+        # for embedded fonts we've already extracted, so a given original
+        # font is only pulled out of the PDF once. A cached ``None`` means
+        # "already tried, not reusable" so we don't retry.
+        self._font_cache: dict[tuple[int, str], tuple[bytes, fitz.Font] | None] = {}
+        self._font_counter = 0
 
     # -- introspection ---------------------------------------------------
 
@@ -188,6 +203,66 @@ class PDFDocument:
         except Exception:
             return (1.0, 1.0, 1.0)
 
+    # -- font reuse --------------------------------------------------------
+
+    def _original_font_bytes(self, page_no: int, pdf_font_name: str) -> tuple[bytes, fitz.Font] | None:
+        """Extract and cache the real embedded font behind a span's PDF font
+        resource name: its raw font-program bytes plus a ``fitz.Font`` for
+        glyph/metrics checks. Returns None if the font isn't embedded or
+        can't be read (e.g. a standard font referenced by name only, or a
+        corrupt font program).
+
+        Deliberately does NOT register the font on the page here -- applying
+        a redaction resets a page's just-registered fonts, so registration
+        must happen fresh, right before each ``insert_text`` call, via
+        ``_pick_font``.
+        """
+        if not pdf_font_name:
+            return None
+        cache_key = (page_no, pdf_font_name)
+        if cache_key in self._font_cache:
+            return self._font_cache[cache_key]
+
+        page = self.doc[page_no]
+        xref = None
+        for entry in page.get_fonts(full=True):
+            if entry[3] == pdf_font_name:
+                xref = entry[0]
+                break
+
+        result: tuple[bytes, fitz.Font] | None = None
+        if xref is not None:
+            try:
+                _, _, _, buf = self.doc.extract_font(xref)
+                if buf:
+                    result = (buf, fitz.Font(fontbuffer=buf))
+            except Exception:
+                result = None
+
+        self._font_cache[cache_key] = result
+        return result
+
+    def _pick_font(
+        self, page: fitz.Page, page_no: int, pdf_font_name: str, flags: int, needed_text: str
+    ) -> tuple[str, fitz.Font]:
+        """Choose and register the font to draw replacement text with.
+
+        Prefers the document's own embedded font (an exact match) when it
+        covers every character in ``needed_text``; otherwise falls back to
+        the closest-matching base-14 font. ``page`` must be the live page
+        object *after* any redaction has already been applied this call.
+        """
+        original = self._original_font_bytes(page_no, pdf_font_name)
+        if original is not None:
+            buf, font_obj = original
+            if all(font_obj.has_glyph(ord(ch)) for ch in needed_text):
+                local_name = f"orig{self._font_counter}"
+                self._font_counter += 1
+                page.insert_font(fontname=local_name, fontbuffer=buf)
+                return local_name, font_obj
+        fallback_name = _base14_font(pdf_font_name, flags)
+        return fallback_name, fitz.Font(fallback_name)
+
     # -- editing ---------------------------------------------------------
 
     def edit_span(self, page_no: int, span_id: str, new_text: str) -> Span:
@@ -209,15 +284,17 @@ class PDFDocument:
         # graphics=0 keeps images/vector art; we only want to drop covered text.
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        # 2. Re-insert the replacement text at the original baseline.
+        # 2. Re-insert the replacement text at the original baseline. Font
+        # selection happens here, after redaction: applying a redaction
+        # resets any font just registered on the page, so it must be
+        # (re-)registered fresh right before use.
         if new_text:
-            fontname = _base14_font(span.font, span.flags)
+            fontname, font = self._pick_font(page, page_no, span.font, span.flags, new_text)
             color = tuple(span.color)
             size = span.size
             # Shrink to fit horizontally if the new text is much wider so it
             # does not overflow the redacted area / following text.
             available = rect.width if rect.width > 1 else page.rect.width
-            font = fitz.Font(fontname)
             text_width = font.text_length(new_text, fontsize=size)
             if text_width > available > 0 and text_width > 0:
                 size = max(4.0, size * available / text_width)
@@ -269,9 +346,12 @@ class PDFDocument:
                 bg = self._background_color(page.number, hit)
                 page.add_redact_annot(hit, fill=bg)
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            # Font selection happens after redaction: applying a redaction
+            # resets any font just registered on the page, so it must be
+            # (re-)registered fresh right before use.
             for hit, font, flags, size, color in styles:
                 if new:
-                    fontname = _base14_font(font, flags)
+                    fontname, _ = self._pick_font(page, page.number, font, flags, new)
                     origin = fitz.Point(hit.x0, hit.y1 - (hit.height * 0.2))
                     page.insert_text(
                         origin,
