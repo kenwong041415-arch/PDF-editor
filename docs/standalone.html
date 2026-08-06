@@ -346,10 +346,12 @@ kbd {
  *     Replacement text is measured against the *original* text's true
  *     on-page width (not just the font's natural glyph advances) to correct
  *     for any custom kerning already baked into the source PDF, so an edit
- *     isn't shrunk to fit based on a false "too wide" reading. A thin ruled
- *     line just below the baseline (e.g. a blank-field underline) is
- *     detected from the rendered canvas and redrawn after covering, since
- *     the cover rectangle would otherwise erase it.
+ *     isn't shrunk to fit based on a false "too wide" reading. A ruled line
+ *     just below the baseline (e.g. a blank-field underline) the cover
+ *     rectangle would otherwise erase is found and redrawn at its exact
+ *     geometry -- read from pdf.js's own parsed drawing operators
+ *     (getOperatorList()), the same source of truth PyMuPDF's get_drawings()
+ *     gives the Python engine, rather than guessed from rendered pixels.
  *
  * Nothing is uploaded anywhere -- all processing happens in this browser tab.
  */
@@ -580,78 +582,95 @@ function sampleColors(context, cnv, box) {
   return { bg, color };
 }
 
-// Detect a thin dark ruled line (e.g. a blank-field underline) sitting just
-// below a text item -- the same vertical zone a cover rectangle needs to
-// reach to blank out descenders, so a plain redaction-style cover would
-// erase it. There's no API to enumerate a PDF's vector drawings from the
-// browser (unlike PyMuPDF's get_drawings()), so this scans the rendered
-// canvas instead, looking for a long, mostly-uniform dark strip just below
-// the baseline.
+// --- Ruled-line detection (for restoring underlines a cover rectangle
+// would otherwise erase) -------------------------------------------------
 //
-// Such a line commonly extends beyond the edited text on one or both sides
-// (e.g. a signature blank drawn wider than the label it sits under), so this
-// scans a wider strip than the text's own box and reports the actual
-// contiguous dark run found, rather than assuming the line spans exactly the
-// text's width -- both to catch lines that only partly overlap the text, and
-// so the caller redraws the line at its true extent, not the text's. Returns
-// {y, x0, x1, color} in canvas pixel space, or null.
-function detectRuledLineRow(context, cnv, box) {
-  const baselineY = Math.round(box.top + box.height);
-  const scanRows = Math.max(1, Math.round(box.height * 0.3));
-  const padX = Math.min(box.width * 0.5, 90);
-  const L = Math.max(0, Math.round(box.left - padX));
-  const R = Math.min(cnv.width, Math.round(box.left + box.width + padX));
-  const W = R - L;
-  if (W < 6) return null;
+// A redaction-style cover rectangle wide enough to blank out text descenders
+// often also erases any ruled line sitting just below the baseline (e.g. a
+// signature/date blank drawn under a label). Three attempts at detecting
+// these from the *rendered canvas* (a dark-pixel-ratio scan, then a
+// longest-dark-run scan with wider padding) kept failing in different ways
+// in practice: sub-pixel/anti-aliasing noise, a line only partially
+// overlapping the edited text's own box, etc.
+//
+// pdf.js has to parse the page's actual drawing operators to render it at
+// all, and exposes that parse via getOperatorList() -- so instead of
+// re-deriving the line's geometry from pixels, this reads it from the same
+// source PyMuPDF's get_drawings() uses on the Python side: the real filled
+// rectangles in the PDF's content stream, with exact coordinates.
+const ruledLineCache = new Map(); // pdf.js Page -> line rects (PDF space)
 
-  const minRunLen = Math.max(20, box.width * 0.3);
-  for (let dy = 0; dy <= scanRows; dy++) {
-    const y = baselineY + dy;
-    if (y < 0 || y >= cnv.height) continue;
-    const row = context.getImageData(L, y, W, 1).data;
-
-    // Find the longest contiguous run of dark pixels in this row.
-    let runStart = -1, bestStart = -1, bestLen = 0, curLen = 0;
-    for (let x = 0; x <= W; x++) {
-      const dark = x < W && (() => {
-        const i = x * 4;
-        return 0.299 * row[i] + 0.587 * row[i + 1] + 0.114 * row[i + 2] < 180;
-      })();
-      if (dark) {
-        if (runStart === -1) runStart = x;
-        curLen++;
-      } else {
-        if (curLen > bestLen) { bestLen = curLen; bestStart = runStart; }
-        runStart = -1;
-        curLen = 0;
-      }
-    }
-
-    // Require a genuinely long run -- a ruled line -- rather than the
-    // scattered, narrow strokes a letter's descenders make.
-    if (bestLen > minRunLen) {
-      let sumR = 0, sumG = 0, sumB = 0;
-      for (let x = bestStart; x < bestStart + bestLen; x++) {
-        const i = x * 4;
-        sumR += row[i]; sumG += row[i + 1]; sumB += row[i + 2];
-      }
-      return {
-        y,
-        x0: L + bestStart,
-        x1: L + bestStart + bestLen,
-        color: [sumR / bestLen / 255, sumG / bestLen / 255, sumB / bestLen / 255],
-      };
-    }
-  }
-  return null;
+function matrixMultiply(m1, m2) {
+  return [
+    m1[0] * m2[0] + m1[1] * m2[2],
+    m1[0] * m2[1] + m1[1] * m2[3],
+    m1[2] * m2[0] + m1[3] * m2[2],
+    m1[2] * m2[1] + m1[3] * m2[3],
+    m1[4] * m2[0] + m1[5] * m2[2] + m2[4],
+    m1[4] * m2[1] + m1[5] * m2[3] + m2[5],
+  ];
 }
 
-// Convert a detected line's canvas-pixel geometry to PDF space using a
-// pdf.js viewport's own coordinate mapping (handles rotation etc.).
-function ruledLineToPdfSpace(viewport, line) {
-  const [x0, y] = viewport.convertToPdfPoint(line.x0, line.y);
-  const [x1] = viewport.convertToPdfPoint(line.x1, line.y);
-  return { x0, x1, y, color: line.color };
+// Parse a page's operator list once into a flat list of thin filled
+// rectangles ({x0, x1, y0, y1, color}) in raw PDF (bottom-left-origin)
+// space -- the same space item.transform values already use elsewhere in
+// this file. Tracks the graphics-state stack (save/restore), the CTM
+// (transform), and the current fill colour, since a rectangle's on-page
+// position and colour both depend on the state active when it was drawn.
+async function getRuledLines(pdfPage) {
+  if (ruledLineCache.has(pdfPage)) return ruledLineCache.get(pdfPage);
+  const opList = await pdfPage.getOperatorList();
+  const OPS = pdfjsLib.OPS;
+  const FILL_OPS = new Set([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke]);
+
+  let ctm = [1, 0, 0, 1, 0, 0];
+  let fillColor = [0, 0, 0];
+  const stack = [];
+  const lines = [];
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    const args = opList.argsArray[i];
+    if (fn === OPS.save) {
+      stack.push({ ctm, fillColor });
+    } else if (fn === OPS.restore) {
+      const prev = stack.pop();
+      if (prev) { ctm = prev.ctm; fillColor = prev.fillColor; }
+    } else if (fn === OPS.transform) {
+      ctm = matrixMultiply(args, ctm);
+    } else if (fn === OPS.setFillRGBColor) {
+      fillColor = [args[0] / 255, args[1] / 255, args[2] / 255];
+    } else if (fn === OPS.setFillGray) {
+      fillColor = [args[0], args[0], args[0]];
+    } else if (fn === OPS.constructPath && FILL_OPS.has(opList.fnArray[i + 1])) {
+      const coords = args[1];
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (let k = 0; k < coords.length; k += 2) {
+        minX = Math.min(minX, coords[k]); maxX = Math.max(maxX, coords[k]);
+        minY = Math.min(minY, coords[k + 1]); maxY = Math.max(maxY, coords[k + 1]);
+      }
+      const [px0, py0] = [ctm[0] * minX + ctm[2] * minY + ctm[4], ctm[1] * minX + ctm[3] * minY + ctm[5]];
+      const [px1, py1] = [ctm[0] * maxX + ctm[2] * maxY + ctm[4], ctm[1] * maxX + ctm[3] * maxY + ctm[5]];
+      const x0 = Math.min(px0, px1), x1 = Math.max(px0, px1);
+      const y0 = Math.min(py0, py1), y1 = Math.max(py0, py1);
+      // A ruled line: thin one way, long the other. Only the thin-and-wide
+      // (horizontal) case is handled, matching what these forms actually use.
+      if (x1 - x0 > 3 && y1 - y0 < 3) {
+        lines.push({ x0, x1, y0, y1, color: fillColor });
+      }
+    }
+  }
+  ruledLineCache.set(pdfPage, lines);
+  return lines;
+}
+
+// Ruled lines overlapping a text run's horizontal span, within the vertical
+// zone a cover rectangle reaches to blank out descenders (where such a line
+// would otherwise get erased). x0/x1/yBaseline/fontSize are in PDF space.
+function findRuledLines(lines, x0, x1, yBaseline, fontSize) {
+  const top = yBaseline + fontSize * 0.94;
+  const bottom = yBaseline - fontSize * 0.26;
+  return lines.filter((l) => l.x1 > x0 && l.x0 < x1 && l.y1 > bottom && l.y0 < top);
 }
 
 // --- Font-style matching ----------------------------------------------
@@ -714,13 +733,13 @@ function openEditor(rec, box) {
   input.select();
 
   let done = false;
-  const commit = () => {
+  const commit = async () => {
     if (done) return;
     done = true;
     const newText = input.value;
     input.remove();
     if (newText === rec.item.str && !current) return;
-    recordEdit(rec, box, newText);
+    await recordEdit(rec, box, newText);
     buildOverlay();
     updateEditCount();
   };
@@ -737,17 +756,18 @@ function openEditor(rec, box) {
 }
 
 // Build and store an edit record for one text item.
-function recordEdit(rec, box, newText) {
+async function recordEdit(rec, box, newText) {
   const key = `${state.page}:${rec.index}`;
   if (newText === rec.item.str) {
     state.edits.delete(key); // reverted to original
     return;
   }
   const { bg, color } = sampleColors(ctx, canvas, box);
-  const line = detectRuledLineRow(ctx, canvas, box);
   const fi = fontInfo(rec);
   const t = rec.item.transform;
   const fontSize = Math.hypot(t[2], t[3]) || rec.item.height || 11;
+  const lines = await getRuledLines(state.pdfPage);
+  const ruledLines = findRuledLines(lines, t[4], t[4] + rec.item.width, t[5], fontSize);
   state.edits.set(key, {
     page: state.page,
     x: t[4],
@@ -761,7 +781,7 @@ function recordEdit(rec, box, newText) {
     fontKey: fi.key,
     fontFamily: fi.css,
     realFontName: getRealFontName(state.pdfPage, rec.item),
-    ruledLine: line ? ruledLineToPdfSpace(state.viewport, line) : null,
+    ruledLines,
   });
 }
 
@@ -799,11 +819,11 @@ async function replaceAll() {
       off.height = Math.floor(vp.height);
       await page.render({ canvasContext: offCtx, viewport: vp }).promise;
 
+      const lines = await getRuledLines(page);
       for (const rec of matches) {
         const newText = rec.item.str.split(find).join(replace);
         const box = offPixelBox(rec.item, vp);
         const { bg, color } = sampleColors(offCtx, off, box);
-        const line = detectRuledLineRow(offCtx, off, box);
         const fi = fontInfo(rec);
         const t = rec.item.transform;
         const fontSize = Math.hypot(t[2], t[3]) || rec.item.height || 11;
@@ -811,7 +831,7 @@ async function replaceAll() {
           page: p, x: t[4], yBaseline: t[5], fontSize, width: rec.item.width,
           newText, origText: rec.item.str, bg, color, fontKey: fi.key, fontFamily: fi.css,
           realFontName: getRealFontName(page, rec.item),
-          ruledLine: line ? ruledLineToPdfSpace(vp, line) : null,
+          ruledLines: findRuledLines(lines, t[4], t[4] + rec.item.width, t[5], fontSize),
         });
         count++;
       }
@@ -968,15 +988,14 @@ async function download() {
           });
         }
 
-        // 3. Restore a ruled line (e.g. a blank-field underline) that step 1
-        // covered over.
-        if (edit.ruledLine) {
-          const rl = edit.ruledLine;
+        // 3. Restore any ruled line (e.g. a blank-field underline) that
+        // step 1 covered over, at its exact original geometry.
+        for (const rl of edit.ruledLines || []) {
           page.drawRectangle({
-            x: Math.min(rl.x0, rl.x1),
-            y: rl.y - 0.4,
-            width: Math.abs(rl.x1 - rl.x0),
-            height: 0.8,
+            x: rl.x0,
+            y: rl.y0,
+            width: rl.x1 - rl.x0,
+            height: rl.y1 - rl.y0,
             color: rgb(rl.color[0], rl.color[1], rl.color[2]),
           });
         }
