@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Word Editor</title>
+  <meta name="description" content="Edit the actual words in a PDF, right in your browser. No upload, no server." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">✎</span>
+      <span>PDF Word Editor</span>
+    </div>
+    <div class="topbar-actions" id="topbar-actions" hidden>
+      <span class="docname" id="docname"></span>
+      <button id="btn-close" class="btn">Open another</button>
+      <button id="btn-download" class="btn btn-primary">Download PDF</button>
+    </div>
+    <a class="ghost-link" href="https://github.com/kenwong041415-arch/pdf-editor" target="_blank" rel="noopener" id="repo-link">Source</a>
+  </header>
+
+  <main>
+    <!-- Upload screen -->
+    <section id="upload-screen" class="upload-screen">
+      <div class="dropzone" id="dropzone">
+        <div class="dropzone-inner">
+          <div class="drop-icon">⬆</div>
+          <h2>Drop a PDF here</h2>
+          <p>or <label class="link" for="file-input">browse your files</label></p>
+          <input type="file" id="file-input" accept="application/pdf" hidden />
+          <p class="hint">
+            Everything happens in your browser — your file never leaves this device.
+            Click any line to edit it, or use Find&nbsp;&amp;&nbsp;Replace.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Editor screen -->
+    <section id="editor-screen" class="editor-screen" hidden>
+      <aside class="sidebar">
+        <div class="panel">
+          <h3>Find &amp; Replace</h3>
+          <input type="text" id="find-input" placeholder="Find text…" />
+          <input type="text" id="replace-input" placeholder="Replace with…" />
+          <button id="btn-replace" class="btn btn-block">Replace all</button>
+          <p class="panel-note" id="replace-status"></p>
+        </div>
+        <div class="panel">
+          <h3>Pages</h3>
+          <div class="pager">
+            <button id="btn-prev" class="btn btn-icon">‹</button>
+            <span id="page-indicator">1 / 1</span>
+            <button id="btn-next" class="btn btn-icon">›</button>
+          </div>
+          <div class="zoom">
+            <button id="btn-zoom-out" class="btn btn-icon">−</button>
+            <span id="zoom-indicator">100%</span>
+            <button id="btn-zoom-in" class="btn btn-icon">+</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Edits</h3>
+          <p class="panel-note" id="edit-count">No edits yet.</p>
+          <button id="btn-reset" class="btn btn-block" hidden>Discard all edits</button>
+        </div>
+        <div class="panel tips">
+          <h3>How to edit</h3>
+          <ul>
+            <li>Click a word/line to edit it in place.</li>
+            <li><kbd>Enter</kbd> saves, <kbd>Esc</kbd> cancels.</li>
+            <li>Edits apply when you download.</li>
+          </ul>
+        </div>
+      </aside>
+
+      <div class="canvas-wrap" id="canvas-wrap">
+        <div class="page-stage" id="page-stage">
+          <canvas id="page-canvas"></canvas>
+          <div id="overlay" class="overlay"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="spinner" class="spinner" hidden><div class="spin"></div><span id="spinner-text">Working…</span></div>
+
+  <!-- Libraries are vendored locally so the site is fully self-contained
+       (works offline, makes no external network requests). -->
+  <script src="vendor/pdf.min.js"></script>
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script src="vendor/fontkit.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
