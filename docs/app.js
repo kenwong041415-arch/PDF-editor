@@ -260,37 +260,71 @@ function sampleColors(context, cnv, box) {
 // erase it. There's no API to enumerate a PDF's vector drawings from the
 // browser (unlike PyMuPDF's get_drawings()), so this scans the rendered
 // canvas instead, looking for a long, mostly-uniform dark strip just below
-// the baseline. Returns {y, color} in canvas pixel space, or null.
+// the baseline.
+//
+// Such a line commonly extends beyond the edited text on one or both sides
+// (e.g. a signature blank drawn wider than the label it sits under), so this
+// scans a wider strip than the text's own box and reports the actual
+// contiguous dark run found, rather than assuming the line spans exactly the
+// text's width -- both to catch lines that only partly overlap the text, and
+// so the caller redraws the line at its true extent, not the text's. Returns
+// {y, x0, x1, color} in canvas pixel space, or null.
 function detectRuledLineRow(context, cnv, box) {
   const baselineY = Math.round(box.top + box.height);
   const scanRows = Math.max(1, Math.round(box.height * 0.3));
-  const L = Math.max(0, Math.round(box.left));
-  const W = Math.min(cnv.width - L, Math.round(box.width) || 1);
+  const padX = Math.min(box.width * 0.5, 90);
+  const L = Math.max(0, Math.round(box.left - padX));
+  const R = Math.min(cnv.width, Math.round(box.left + box.width + padX));
+  const W = R - L;
   if (W < 6) return null;
+
+  const minRunLen = Math.max(20, box.width * 0.3);
   for (let dy = 0; dy <= scanRows; dy++) {
     const y = baselineY + dy;
     if (y < 0 || y >= cnv.height) continue;
     const row = context.getImageData(L, y, W, 1).data;
-    let darkCount = 0, sumR = 0, sumG = 0, sumB = 0;
-    for (let x = 0; x < W; x++) {
-      const i = x * 4;
-      const lum = 0.299 * row[i] + 0.587 * row[i + 1] + 0.114 * row[i + 2];
-      if (lum < 180) { darkCount++; sumR += row[i]; sumG += row[i + 1]; sumB += row[i + 2]; }
+
+    // Find the longest contiguous run of dark pixels in this row.
+    let runStart = -1, bestStart = -1, bestLen = 0, curLen = 0;
+    for (let x = 0; x <= W; x++) {
+      const dark = x < W && (() => {
+        const i = x * 4;
+        return 0.299 * row[i] + 0.587 * row[i + 1] + 0.114 * row[i + 2] < 180;
+      })();
+      if (dark) {
+        if (runStart === -1) runStart = x;
+        curLen++;
+      } else {
+        if (curLen > bestLen) { bestLen = curLen; bestStart = runStart; }
+        runStart = -1;
+        curLen = 0;
+      }
     }
-    // Require a long, mostly-continuous dark run -- a genuine ruled line --
-    // rather than the scattered, narrow strokes a letter's descenders make.
-    if (darkCount / W > 0.7) {
-      return { y, color: [sumR / darkCount / 255, sumG / darkCount / 255, sumB / darkCount / 255] };
+
+    // Require a genuinely long run -- a ruled line -- rather than the
+    // scattered, narrow strokes a letter's descenders make.
+    if (bestLen > minRunLen) {
+      let sumR = 0, sumG = 0, sumB = 0;
+      for (let x = bestStart; x < bestStart + bestLen; x++) {
+        const i = x * 4;
+        sumR += row[i]; sumG += row[i + 1]; sumB += row[i + 2];
+      }
+      return {
+        y,
+        x0: L + bestStart,
+        x1: L + bestStart + bestLen,
+        color: [sumR / bestLen / 255, sumG / bestLen / 255, sumB / bestLen / 255],
+      };
     }
   }
   return null;
 }
 
-// Convert a detected line's canvas-pixel row to a PDF-space rectangle using
-// a pdf.js viewport's own coordinate mapping (handles rotation etc.).
-function ruledLineToPdfSpace(viewport, box, line) {
-  const [x0, y] = viewport.convertToPdfPoint(box.left, line.y);
-  const [x1] = viewport.convertToPdfPoint(box.left + box.width, line.y);
+// Convert a detected line's canvas-pixel geometry to PDF space using a
+// pdf.js viewport's own coordinate mapping (handles rotation etc.).
+function ruledLineToPdfSpace(viewport, line) {
+  const [x0, y] = viewport.convertToPdfPoint(line.x0, line.y);
+  const [x1] = viewport.convertToPdfPoint(line.x1, line.y);
   return { x0, x1, y, color: line.color };
 }
 
@@ -401,7 +435,7 @@ function recordEdit(rec, box, newText) {
     fontKey: fi.key,
     fontFamily: fi.css,
     realFontName: getRealFontName(state.pdfPage, rec.item),
-    ruledLine: line ? ruledLineToPdfSpace(state.viewport, box, line) : null,
+    ruledLine: line ? ruledLineToPdfSpace(state.viewport, line) : null,
   });
 }
 
@@ -451,7 +485,7 @@ async function replaceAll() {
           page: p, x: t[4], yBaseline: t[5], fontSize, width: rec.item.width,
           newText, origText: rec.item.str, bg, color, fontKey: fi.key, fontFamily: fi.css,
           realFontName: getRealFontName(page, rec.item),
-          ruledLine: line ? ruledLineToPdfSpace(vp, box, line) : null,
+          ruledLine: line ? ruledLineToPdfSpace(vp, line) : null,
         });
         count++;
       }
