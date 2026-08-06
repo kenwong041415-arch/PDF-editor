@@ -343,6 +343,13 @@ kbd {
  *       2. If that font can't be reused (not embedded, corrupt, or missing a
  *          glyph the replacement text needs), fall back to a standard font
  *          matched to the original style (serif/mono, bold, italic).
+ *     Replacement text is measured against the *original* text's true
+ *     on-page width (not just the font's natural glyph advances) to correct
+ *     for any custom kerning already baked into the source PDF, so an edit
+ *     isn't shrunk to fit based on a false "too wide" reading. A thin ruled
+ *     line just below the baseline (e.g. a blank-field underline) is
+ *     detected from the rendered canvas and redrawn after covering, since
+ *     the cover rectangle would otherwise erase it.
  *
  * Nothing is uploaded anywhere -- all processing happens in this browser tab.
  */
@@ -573,6 +580,46 @@ function sampleColors(context, cnv, box) {
   return { bg, color };
 }
 
+// Detect a thin dark ruled line (e.g. a blank-field underline) sitting just
+// below a text item -- the same vertical zone a cover rectangle needs to
+// reach to blank out descenders, so a plain redaction-style cover would
+// erase it. There's no API to enumerate a PDF's vector drawings from the
+// browser (unlike PyMuPDF's get_drawings()), so this scans the rendered
+// canvas instead, looking for a long, mostly-uniform dark strip just below
+// the baseline. Returns {y, color} in canvas pixel space, or null.
+function detectRuledLineRow(context, cnv, box) {
+  const baselineY = Math.round(box.top + box.height);
+  const scanRows = Math.max(1, Math.round(box.height * 0.3));
+  const L = Math.max(0, Math.round(box.left));
+  const W = Math.min(cnv.width - L, Math.round(box.width) || 1);
+  if (W < 6) return null;
+  for (let dy = 0; dy <= scanRows; dy++) {
+    const y = baselineY + dy;
+    if (y < 0 || y >= cnv.height) continue;
+    const row = context.getImageData(L, y, W, 1).data;
+    let darkCount = 0, sumR = 0, sumG = 0, sumB = 0;
+    for (let x = 0; x < W; x++) {
+      const i = x * 4;
+      const lum = 0.299 * row[i] + 0.587 * row[i + 1] + 0.114 * row[i + 2];
+      if (lum < 180) { darkCount++; sumR += row[i]; sumG += row[i + 1]; sumB += row[i + 2]; }
+    }
+    // Require a long, mostly-continuous dark run -- a genuine ruled line --
+    // rather than the scattered, narrow strokes a letter's descenders make.
+    if (darkCount / W > 0.7) {
+      return { y, color: [sumR / darkCount / 255, sumG / darkCount / 255, sumB / darkCount / 255] };
+    }
+  }
+  return null;
+}
+
+// Convert a detected line's canvas-pixel row to a PDF-space rectangle using
+// a pdf.js viewport's own coordinate mapping (handles rotation etc.).
+function ruledLineToPdfSpace(viewport, box, line) {
+  const [x0, y] = viewport.convertToPdfPoint(box.left, line.y);
+  const [x1] = viewport.convertToPdfPoint(box.left + box.width, line.y);
+  return { x0, x1, y, color: line.color };
+}
+
 // --- Font-style matching ----------------------------------------------
 function fontInfo(rec) {
   const style = rec.styles && rec.styles[rec.item.fontName];
@@ -663,6 +710,7 @@ function recordEdit(rec, box, newText) {
     return;
   }
   const { bg, color } = sampleColors(ctx, canvas, box);
+  const line = detectRuledLineRow(ctx, canvas, box);
   const fi = fontInfo(rec);
   const t = rec.item.transform;
   const fontSize = Math.hypot(t[2], t[3]) || rec.item.height || 11;
@@ -679,6 +727,7 @@ function recordEdit(rec, box, newText) {
     fontKey: fi.key,
     fontFamily: fi.css,
     realFontName: getRealFontName(state.pdfPage, rec.item),
+    ruledLine: line ? ruledLineToPdfSpace(state.viewport, box, line) : null,
   });
 }
 
@@ -720,6 +769,7 @@ async function replaceAll() {
         const newText = rec.item.str.split(find).join(replace);
         const box = offPixelBox(rec.item, vp);
         const { bg, color } = sampleColors(offCtx, off, box);
+        const line = detectRuledLineRow(offCtx, off, box);
         const fi = fontInfo(rec);
         const t = rec.item.transform;
         const fontSize = Math.hypot(t[2], t[3]) || rec.item.height || 11;
@@ -727,6 +777,7 @@ async function replaceAll() {
           page: p, x: t[4], yBaseline: t[5], fontSize, width: rec.item.width,
           newText, origText: rec.item.str, bg, color, fontKey: fi.key, fontFamily: fi.css,
           realFontName: getRealFontName(page, rec.item),
+          ruledLine: line ? ruledLineToPdfSpace(vp, box, line) : null,
         });
         count++;
       }
@@ -854,7 +905,25 @@ async function download() {
         if (edit.newText) {
           const font = await pickFont(outDoc, fontCache, edit.page, edit.realFontName, edit.fontKey, edit.newText);
           let size = edit.fontSize;
-          const w = font.widthOfTextAtSize(edit.newText, size);
+          let w = font.widthOfTextAtSize(edit.newText, size);
+          if (edit.origText) {
+            // The original text may itself already be kerned tighter or
+            // looser than this font's natural spacing (common in filled form
+            // fields sized to fit a printed box) -- e.g. a run whose true
+            // on-page width is 169pt can measure as 183pt using the font's
+            // own natural advances. Scale our estimate by that same ratio so
+            // a same-length or slightly-longer edit isn't shrunk based on a
+            // false "too wide" reading caused purely by the mismatch, rather
+            // than by the edit actually being longer.
+            try {
+              const origNatural = font.widthOfTextAtSize(edit.origText, size);
+              if (origNatural > 0 && edit.width > 0) w *= edit.width / origNatural;
+            } catch (e) {
+              // Original text has a character this font can't encode for
+              // measurement purposes (only possible for the standard-font
+              // fallback) -- fall back to the uncorrected estimate.
+            }
+          }
           if (edit.width > 0 && w > edit.width) size = Math.max(4, size * (edit.width / w));
           page.drawText(edit.newText, {
             x: edit.x,
@@ -862,6 +931,19 @@ async function download() {
             size,
             font,
             color: rgb(edit.color[0], edit.color[1], edit.color[2]),
+          });
+        }
+
+        // 3. Restore a ruled line (e.g. a blank-field underline) that step 1
+        // covered over.
+        if (edit.ruledLine) {
+          const rl = edit.ruledLine;
+          page.drawRectangle({
+            x: Math.min(rl.x0, rl.x1),
+            y: rl.y - 0.4,
+            width: Math.abs(rl.x1 - rl.x0),
+            height: 0.8,
+            color: rgb(rl.color[0], rl.color[1], rl.color[2]),
           });
         }
       } catch (editErr) {

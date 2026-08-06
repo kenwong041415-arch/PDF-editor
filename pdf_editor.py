@@ -203,6 +203,33 @@ class PDFDocument:
         except Exception:
             return (1.0, 1.0, 1.0)
 
+    def _find_ruled_lines(self, page_no: int, rect: fitz.Rect) -> list[tuple[fitz.Rect, tuple]]:
+        """Find thin ruled lines (e.g. a signature/date blank's underline)
+        overlapping ``rect``, so they can be redrawn after a redaction.
+
+        A redaction fills its whole rectangle with the background colour,
+        which erases any such line if it sits close enough to the text
+        baseline -- often true, since that's also where a redaction needs to
+        reach to cover descenders. Returns each line's rect and fill colour;
+        callers redraw them after redacting and inserting new text.
+        """
+        page = self.doc[page_no]
+        found = []
+        try:
+            for drawing in page.get_drawings():
+                r = drawing["rect"]
+                fill = drawing.get("fill")
+                if fill is not None and r.height < 3 and r.width > 3 and r.intersects(rect):
+                    found.append((fitz.Rect(r), fill))
+        except Exception:
+            return []
+        return found
+
+    def _restore_ruled_lines(self, page_no: int, lines: list[tuple[fitz.Rect, tuple]]) -> None:
+        page = self.doc[page_no]
+        for line_rect, fill in lines:
+            page.draw_rect(line_rect, color=None, fill=fill, width=0)
+
     # -- font reuse --------------------------------------------------------
 
     def _original_font_bytes(self, page_no: int, pdf_font_name: str) -> tuple[bytes, fitz.Font] | None:
@@ -278,6 +305,7 @@ class PDFDocument:
         page = self.doc[page_no]
         rect = fitz.Rect(*span.bbox)
         bg = self._background_color(page_no, rect)
+        ruled_lines = self._find_ruled_lines(page_no, rect)
 
         # 1. Remove the original glyphs.
         page.add_redact_annot(rect, fill=bg)
@@ -296,7 +324,19 @@ class PDFDocument:
             # does not overflow the redacted area / following text.
             available = rect.width if rect.width > 1 else page.rect.width
             text_width = font.text_length(new_text, fontsize=size)
-            if text_width > available > 0 and text_width > 0:
+            if span.text:
+                # The original text may itself already be kerned tighter or
+                # looser than this font's natural spacing (common in filled
+                # form fields sized to fit a printed box) -- e.g. a run whose
+                # true on-page width is 169pt can measure as 183pt using the
+                # font's own natural advances. Scale our estimate by that same
+                # ratio so a same-length or slightly-longer edit isn't shrunk
+                # based on a false "too wide" reading caused purely by the
+                # mismatch, rather than by the edit actually being longer.
+                orig_natural_width = font.text_length(span.text, fontsize=size)
+                if orig_natural_width > 0 and available > 0:
+                    text_width *= available / orig_natural_width
+            if text_width > available > 0:
                 size = max(4.0, size * available / text_width)
             page.insert_text(
                 fitz.Point(*span.origin),
@@ -305,6 +345,10 @@ class PDFDocument:
                 fontname=fontname,
                 color=color,
             )
+
+        # 3. Restore any ruled line (e.g. a blank-field underline) the
+        # redaction's fill wiped out.
+        self._restore_ruled_lines(page_no, ruled_lines)
 
         # Return the refreshed span info (best-effort re-read).
         updated = self._find_span(page_no, span_id)
@@ -336,12 +380,16 @@ class PDFDocument:
             hits = page.search_for(old)
             if not hits:
                 continue
-            # Capture style from the spans overlapping each hit before redacting.
+            # Capture style from the spans overlapping each hit, and any
+            # ruled lines (e.g. blank-field underlines) a redaction's fill
+            # would wipe out, before redacting.
             styles: list[tuple[fitz.Rect, str, int, float, tuple]] = []
             data = page.get_text("dict")
+            all_ruled_lines: list[tuple[fitz.Rect, tuple]] = []
             for hit in hits:
                 style = self._style_at(data, hit)
                 styles.append((hit, *style))
+                all_ruled_lines.extend(self._find_ruled_lines(page.number, hit))
             for hit, font, flags, size, color in styles:
                 bg = self._background_color(page.number, hit)
                 page.add_redact_annot(hit, fill=bg)
@@ -361,6 +409,7 @@ class PDFDocument:
                         color=color,
                     )
                 count += 1
+            self._restore_ruled_lines(page.number, all_ruled_lines)
         return count
 
     @staticmethod
