@@ -212,15 +212,30 @@ class PDFDocument:
         baseline -- often true, since that's also where a redaction needs to
         reach to cover descenders. Returns each line's rect and fill colour;
         callers redraw them after redacting and inserting new text.
+
+        Checks each drawing's individual path items rather than the drawing's
+        own aggregate ``rect``: a PDF can (and, in practice, does) combine
+        several unrelated rectangles into one filled path for file-size
+        reasons -- e.g. a 30pt-wide underline bundled with a completely
+        different 600pt-wide rule elsewhere on the page, both filled by one
+        operation. That aggregate's bounding box covers both and is neither
+        thin nor near either original rectangle, so using it directly would
+        both miss the real line and risk treating a huge, unrelated region as
+        one. Each item is checked on its own instead.
         """
         page = self.doc[page_no]
         found = []
         try:
             for drawing in page.get_drawings():
-                r = drawing["rect"]
                 fill = drawing.get("fill")
-                if fill is not None and r.height < 3 and r.width > 3 and r.intersects(rect):
-                    found.append((fitz.Rect(r), fill))
+                if fill is None:
+                    continue
+                for item in drawing.get("items", []):
+                    if item[0] != "re":
+                        continue
+                    r = item[1]
+                    if r.height < 3 and r.width > 3 and r.intersects(rect):
+                        found.append((fitz.Rect(r), fill))
         except Exception:
             return []
         return found

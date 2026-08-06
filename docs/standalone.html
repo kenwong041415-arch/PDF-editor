@@ -622,11 +622,20 @@ async function getRuledLines(pdfPage) {
   const opList = await pdfPage.getOperatorList();
   const OPS = pdfjsLib.OPS;
   const FILL_OPS = new Set([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke]);
+  // How many (x, y) points each path-construction op consumes from the
+  // flat coords array, needed to split a compound path back into the
+  // individual subpaths it was built from (see below).
+  const POINT_COUNT = {
+    [OPS.moveTo]: 1, [OPS.lineTo]: 1,
+    [OPS.curveTo]: 3, [OPS.curveTo2]: 2, [OPS.curveTo3]: 2,
+    [OPS.closePath]: 0,
+  };
 
   let ctm = [1, 0, 0, 1, 0, 0];
   let fillColor = [0, 0, 0];
   const stack = [];
   const lines = [];
+  const transformPt = (x, y) => [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
@@ -643,21 +652,46 @@ async function getRuledLines(pdfPage) {
     } else if (fn === OPS.setFillGray) {
       fillColor = [args[0], args[0], args[0]];
     } else if (fn === OPS.constructPath && FILL_OPS.has(opList.fnArray[i + 1])) {
-      const coords = args[1];
+      // A PDF commonly bundles several unrelated rectangles into one filled
+      // path for file-size reasons -- confirmed on a real document: a 30pt
+      // signature-blank underline fused into the same fill as a completely
+      // unrelated 600pt rule elsewhere on the page. An aggregate bounding
+      // box over the whole compound path is neither thin nor near either
+      // real shape, so it would both miss the real line and risk treating a
+      // huge, unrelated region as one. This walks subOps/coords and splits
+      // the path back into its individual subpaths (each starting at a
+      // moveTo), computing each one's own bounding box separately.
+      const [subOps, coords] = args;
+      let coordIdx = 0;
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (let k = 0; k < coords.length; k += 2) {
-        minX = Math.min(minX, coords[k]); maxX = Math.max(maxX, coords[k]);
-        minY = Math.min(minY, coords[k + 1]); maxY = Math.max(maxY, coords[k + 1]);
+      let malformed = false;
+
+      const flushSubpath = () => {
+        if (minX <= maxX) {
+          const [px0, py0] = transformPt(minX, minY);
+          const [px1, py1] = transformPt(maxX, maxY);
+          const x0 = Math.min(px0, px1), x1 = Math.max(px0, px1);
+          const y0 = Math.min(py0, py1), y1 = Math.max(py0, py1);
+          // A ruled line: thin one way, long the other -- only the
+          // thin-and-wide (horizontal) case is handled, matching what
+          // these forms actually use.
+          if (x1 - x0 > 3 && y1 - y0 < 3) lines.push({ x0, x1, y0, y1, color: fillColor });
+        }
+        minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+      };
+
+      for (const op of subOps) {
+        if (op === OPS.moveTo) flushSubpath();
+        const npts = POINT_COUNT[op];
+        if (npts === undefined) { malformed = true; break; } // unhandled op (e.g. a curve-heavy shape) -- skip this path rather than guess
+        for (let p = 0; p < npts; p++) {
+          const x = coords[coordIdx], y = coords[coordIdx + 1];
+          coordIdx += 2;
+          minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        }
       }
-      const [px0, py0] = [ctm[0] * minX + ctm[2] * minY + ctm[4], ctm[1] * minX + ctm[3] * minY + ctm[5]];
-      const [px1, py1] = [ctm[0] * maxX + ctm[2] * maxY + ctm[4], ctm[1] * maxX + ctm[3] * maxY + ctm[5]];
-      const x0 = Math.min(px0, px1), x1 = Math.max(px0, px1);
-      const y0 = Math.min(py0, py1), y1 = Math.max(py0, py1);
-      // A ruled line: thin one way, long the other. Only the thin-and-wide
-      // (horizontal) case is handled, matching what these forms actually use.
-      if (x1 - x0 > 3 && y1 - y0 < 3) {
-        lines.push({ x0, x1, y0, y1, color: fillColor });
-      }
+      if (!malformed) flushSubpath();
     }
   }
   ruledLineCache.set(pdfPage, lines);
